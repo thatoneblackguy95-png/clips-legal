@@ -1,7 +1,9 @@
 // ==UserScript==
 // @name         WaveRider — TradingView Paper Trading Injector
 // @namespace    https://muse.ai/waverider
-// @version      1.1.0
+// @version      1.1.1
+// @updateURL    https://raw.githubusercontent.com/thatoneblackguy95-png/clips-legal/waverider/waverider.user.js
+// @downloadURL  https://raw.githubusercontent.com/thatoneblackguy95-png/clips-legal/waverider/waverider.user.js
 // @description  Autonomous wave-riding scalper for TradingView PAPER trading only. Tiered equity risk management: safe start/recovery mode, profit tiers that unlock bigger sizing as equity grows, checkpoint ratchets that drop back to safe on drawdown. NEVER touches real money — refuses to run unless the Paper Trading account is active.
 // @author       Icarus for Travis
 // @match        https://www.tradingview.com/chart/*
@@ -138,6 +140,113 @@ const SEL = {
   submitBtn: 'button.e3ECpiMr',                             // "Buy … MARKET"
 };
 
+/* ───────────────────────── ticket finder (resilient) ─────────────────────────
+ * The order-widget class hashes change between TradingView deploys, so we
+ * never rely on a single selector. Strategies tried in order:
+ *   1. Primary hashed selectors (fast path when they match)
+ *   2. aria-label pattern: buttons named "Buy 80,527" / "Sell 80,527"
+ *   3. Anchor on #quantity-field, then search its container for buy/sell buttons
+ *   4. Scan all buttons, filter by text content "Buy {price}" / "Sell {price}"
+ * Every attempt logs to the F12 console so failures are diagnosable. */
+
+function wrlog() {
+  try { console.log.apply(console, ['[WaveRider]'].concat([].slice.call(arguments))); } catch (e) {}
+}
+
+const PX_RE = /[\d,]+(\.\d+)?/;
+
+function parsePrice(s) {
+  if (!s) return null;
+  const m = String(s).replace(/,/g, '').match(/(\d+(\.\d+)?)/);
+  return m ? parseFloat(m[1]) : null;
+}
+
+function isBuySellBtn(el, side) {
+  if (!el || el.tagName !== 'BUTTON') return false;
+  const label = (el.getAttribute('aria-label') || '') + ' ' + (el.textContent || '');
+  const t = label.trim();
+  const re = side === 'buy' ? /^buy\s/i : /^sell\s/i;
+  return re.test(t) && PX_RE.test(t);
+}
+
+const Ticket = {
+  lastStrategy: null,
+
+  /** Return {sellBtn, buyBtn, qtyField} or null. Logs each attempt. */
+  find() {
+    // 1) primary hashed selectors
+    let sell = $(SEL.sellBtn), buy = $(SEL.buyBtn);
+    if (sell && buy && isBuySellBtn(sell, 'sell') && isBuySellBtn(buy, 'buy')) {
+      this.lastStrategy = 'primary';
+      return { sellBtn: sell, buyBtn: buy, qtyField: $(SEL.qtyField) };
+    }
+    wrlog('strategy primary failed, trying aria-label scan');
+
+    // 2) aria-label pattern scan
+    const btns = $$('button');
+    sell = btns.find(b => {
+      const a = b.getAttribute('aria-label') || '';
+      return /^sell\s/i.test(a.trim()) && PX_RE.test(a);
+    }) || null;
+    buy = btns.find(b => {
+      const a = b.getAttribute('aria-label') || '';
+      return /^buy\s/i.test(a.trim()) && PX_RE.test(a);
+    }) || null;
+    if (sell && buy) {
+      this.lastStrategy = 'aria-label';
+      wrlog('ticket found via aria-label scan');
+      return { sellBtn: sell, buyBtn: buy, qtyField: $(SEL.qtyField) };
+    }
+    wrlog('strategy aria-label failed, trying qty-field anchor');
+
+    // 3) anchor on #quantity-field, search upward for the ticket container
+    const qty = $(SEL.qtyField);
+    if (qty) {
+      let node = qty;
+      for (let i = 0; i < 8 && node && node !== document.body; i++) {
+        node = node.parentElement;
+        if (!node) break;
+        const cands = $$('button', node).filter(b => isBuySellBtn(b, 'buy') || isBuySellBtn(b, 'sell'));
+        const s2 = cands.find(b => isBuySellBtn(b, 'sell'));
+        const b2 = cands.find(b => isBuySellBtn(b, 'buy'));
+        if (s2 && b2) {
+          this.lastStrategy = 'qty-anchor';
+          wrlog('ticket found via #quantity-field anchor (depth ' + (i + 1) + ')');
+          return { sellBtn: s2, buyBtn: b2, qtyField: qty };
+        }
+      }
+    }
+    wrlog('strategy qty-anchor failed, trying full button text scan');
+
+    // 4) full button text scan
+    sell = btns.find(b => isBuySellBtn(b, 'sell')) || null;
+    buy = btns.find(b => isBuySellBtn(b, 'buy')) || null;
+    if (sell && buy) {
+      this.lastStrategy = 'text-scan';
+      wrlog('ticket found via full button text scan');
+      return { sellBtn: sell, buyBtn: buy, qtyField: $(SEL.qtyField) };
+    }
+    this.lastStrategy = null;
+    return null;
+  },
+
+  /** Find the order submit button for a side, with fallbacks. */
+  findSubmit(side) {
+    let sub = $(SEL.submitBtn);
+    if (sub) return sub;
+    wrlog('submit primary selector failed, scanning by label');
+    const want = side === 'buy' ? /^buy\s/i : /^sell\s/i;
+    const btns = $$('button');
+    sub = btns.find(b => {
+      const t = ((b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '')).trim();
+      return want.test(t) && /market/i.test(t);
+    });
+    if (sub) { wrlog('submit found via label scan'); return sub; }
+    wrlog('submit button not found');
+    return null;
+  },
+};
+
 /* ───────────────────────── tiny utils ───────────────────────── */
 
 const $  = (s, r = document) => r.querySelector(s);
@@ -175,13 +284,12 @@ const Feed = {
 
   /** Re-query the ticket buttons and return {bid, ask, mid} or null. */
   read() {
-    const sellBtn = $(SEL.sellBtn);
-    const buyBtn  = $(SEL.buyBtn);
-    if (!sellBtn || !buyBtn) return null;
-    const bid = parsePrice(sellBtn.getAttribute('aria-label') ||
-                           sellBtn.textContent);
-    const ask = parsePrice(buyBtn.getAttribute('aria-label') ||
-                           buyBtn.textContent);
+    const t = Ticket.find();
+    if (!t) return null;
+    const bid = parsePrice(t.sellBtn.getAttribute('aria-label') ||
+                           t.sellBtn.textContent);
+    const ask = parsePrice(t.buyBtn.getAttribute('aria-label') ||
+                           t.buyBtn.textContent);
     if (!bid || !ask || bid <= 0 || ask <= 0) return null;
     const mid = (bid + ask) / 2;
     this.lastMid = mid;
@@ -523,14 +631,16 @@ const Exec = {
       UI.log('throttled: ' + why);
       return null;
     }
-    const sideBtn = $(side === 'buy' ? SEL.buyBtn : SEL.sellBtn);
+    const t = Ticket.find();
+    const sideBtn = t && (side === 'buy' ? t.buyBtn : t.sellBtn);
     if (!sideBtn) { UI.log('ERR: side button missing'); return null; }
 
     const prePx = Feed.lastMid;
     sideBtn.click();
     await sleep(450);
 
-    const qty = $(SEL.qtyField);
+    const t2 = Ticket.find();
+    const qty = t2 && t2.qtyField;
     if (!qty) { UI.log('ERR: qty field missing after side click'); return null; }
     setNativeInput(qty, marginUSD.toFixed(2));
     await sleep(300);
@@ -543,7 +653,7 @@ const Exec = {
       return null;
     }
 
-    const submit = $(SEL.submitBtn);
+    const submit = Ticket.findSubmit(side);
     if (!submit) { UI.log('ERR: submit button missing'); return null; }
     const label = (submit.getAttribute('aria-label') || submit.textContent || '');
     const expectSide = side === 'buy' ? 'buy' : 'sell';
@@ -710,7 +820,7 @@ const UI = {
     d.innerHTML = `
       <div class="wr-head">
         <span class="wr-dot" id="wr-dot"></span>
-        <b>WaveRider</b><span class="wr-ver">v1.1</span>
+        <b>WaveRider</b><span class="wr-ver">v1.1.1</span>
         <span style="flex:1"></span>
         <button id="wr-start">START</button>
         <button id="wr-stop">STOP</button>
@@ -730,6 +840,7 @@ const UI = {
       <div class="wr-row">
         <button id="wr-flat" class="wr-warn">PANIC FLATTEN</button>
       </div>
+      <div id="wr-status" class="wr-status">Booting…</div>
       <div id="wr-log" class="wr-log"></div>`;
     const st = document.createElement('style');
     st.textContent = `
@@ -755,7 +866,11 @@ const UI = {
       #waverider-panel .wr-warn{width:100%;background:#3a1414;border-color:#7f1d1d;color:#fca5a5}
       #waverider-panel .wr-log{max-height:130px;overflow-y:auto;padding:6px 10px 10px;
         font-size:10.5px;color:#7d8ba0;border-top:1px solid #1d2634}
-      #waverider-panel .wr-log div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}`;
+      #waverider-panel .wr-log div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      #waverider-panel .wr-status{padding:6px 10px;font-size:11px;color:#f59e0b;
+        border-top:1px solid #1d2634}
+      #waverider-panel .wr-status.ok{color:#22c55e}
+      #waverider-panel .wr-status.bad{color:#ef4444}`;
     document.head.appendChild(st);
     document.body.appendChild(d);
     this.el = d;
@@ -773,6 +888,16 @@ const UI = {
     this.logEl.prepend(div);
     while (this.logEl.children.length > 40)
       this.logEl.removeChild(this.logEl.lastChild);
+  },
+
+  /** Panel status line: tone = '' | 'ok' | 'bad'. */
+  setStatus(msg, tone) {
+    if (!this.el) return;
+    const e = $('#wr-status', this.el);
+    if (!e) return;
+    e.textContent = msg;
+    e.classList.toggle('ok', tone === 'ok');
+    e.classList.toggle('bad', tone === 'bad');
   },
 
   render(sigInfo) {
@@ -823,7 +948,7 @@ function confirmPaperAccount() {
   // TradingView paper account shows "Paper Trading" in the account switcher.
   if (/paper trading/i.test(body)) return true;
   // Fallback: the order ticket widget exists on the paper account layout.
-  if ($(SEL.buyBtn) && $(SEL.sellBtn) && $(SEL.qtyField)) {
+  if (Ticket.find()) {
     UI.log('WARN: paper label not found — verify account is PAPER before START');
     return 'unverified';
   }
@@ -1128,14 +1253,41 @@ const Engine = {
 (function boot() {
   if (window.__waverider_booted) return;
   window.__waverider_booted = true;
+  wrlog('boot: WaveRider v1.1.1 loaded on', location.href);
+
+  // Show the panel IMMEDIATELY — never wait for TradingView elements.
+  UI.build();
+  UI.setStatus('Waiting for order ticket…');
+  UI.log('WaveRider v1.1.1 loaded. Looking for the order ticket…');
+  wrlog('boot: panel built, polling for order ticket');
+
+  const t0 = Date.now();
+  let tries = 0;
   const wait = setInterval(() => {
-    if ($(SEL.buyBtn) && $(SEL.sellBtn)) {
+    tries++;
+    const t = Ticket.find();
+    if (t) {
       clearInterval(wait);
-      UI.build();
-      UI.log('WaveRider loaded. Confirm PAPER account + 10x leverage, then START.');
+      wrlog('boot: ticket ready via strategy "' + Ticket.lastStrategy +
+            '" after ' + tries + ' tries');
+      UI.setStatus('Ready — confirm PAPER account + 10x leverage, then START', 'ok');
+      UI.log('Order ticket found (' + Ticket.lastStrategy + '). ' +
+             'Confirm PAPER account + 10x leverage, then START.');
       // warm the feed so the first paint isn't empty
       Feed.read();
       setInterval(() => { if (!State.running) UI.render(Strat.score()); }, 1000);
+      return;
+    }
+    if (tries % 5 === 0) {
+      wrlog('boot: ticket not found yet (' + tries + ' tries, ' +
+            Math.round((Date.now() - t0) / 1000) + 's)');
+    }
+    if (Date.now() - t0 > 30000) {
+      clearInterval(wait);
+      wrlog('boot: TIMEOUT — order ticket not found after 30s');
+      UI.setStatus('Order ticket not found — open the Trading panel (right sidebar)', 'bad');
+      UI.log('Ticket not found after 30s. Open the paper-trading panel ' +
+             '(right sidebar, "Trading" tab) so the order ticket renders, then reload.');
     }
   }, 1000);
 })();
